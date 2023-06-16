@@ -1,0 +1,918 @@
+From 57646d84c76be44406fe447f20f5bc62b6c746d6 Mon Sep 17 00:00:00 2001
+From: g00513643 <gongnanxue@huawei.com>
+Date: Thu, 15 Jun 2023 15:09:57 +0800
+Subject: [PATCH] add selfProximity debug code
+
+---
+ .../Core/ConjugateGradientSolver.cpp          | 353 ++++++++++-------
+ Solvers/VenusSolver/Core/DumpSelfProximity.h  | 370 ++++++++++++++++++
+ Solvers/VenusSolver/Core/VenusParameters.h    |   2 +-
+ .../Dynamics/SelfCollisionProximityHandler.h  |   3 +-
+ Solvers/VenusSolver/Lbvh/lbvh.h               |   3 +-
+ .../SimulationScene/SimulationScene.cpp       |   6 +-
+ 6 files changed, 582 insertions(+), 155 deletions(-)
+ create mode 100644 Solvers/VenusSolver/Core/DumpSelfProximity.h
+
+diff --git a/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp b/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp
+index b21e474e..0d3e5fd8 100644
+--- a/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp
++++ b/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp
+@@ -37,6 +37,7 @@
+ #include "../untangle/gia.cuh"
+ #include "basic/ilog.h"
+ #include "../Dynamics/VenusSpMatCudaMixCollision.h"
++#include "DumpSelfProximity.h"
+ 
+ #define DEBUG_PID 0
+ ConjugateGradientSolver::ConjugateGradientSolver() {
+@@ -56,50 +57,50 @@ void ConjugateGradientSolver::UpdateGPU(float deltaTime, bool bDynamic, VenusSim
+ {
+ 
+     float h = deltaTime;
+-    float h2 = h * h;
++    // float h2 = h * h;
+ 
+     GPUTimer timer;
+ 
+-    //memcpy(simData.vecPositionsBk.data(), simData.positions, sizeof(float4) * simData.numParticle);
+-    bool enableSelfCollision = false; //params.bEnableSelfCollison;
+-    //timer.start();
+-    simData.spMat.initializeSparseEntries();
+-    //timer.end("Initilize raw block entries");
++    // //memcpy(simData.vecPositionsBk.data(), simData.positions, sizeof(float4) * simData.numParticle);
++    // bool enableSelfCollision = false; //params.bEnableSelfCollison;
++    // //timer.start();
++    // simData.spMat.initializeSparseEntries();
++    // //timer.end("Initilize raw block entries");
+ 
+-    //update dragged particle data
+-    if (simData.dragParticleIDs.size())
+-    {
+-        int particleID = simData.dragParticleIDs[0];
++    // //update dragged particle data
++    // if (simData.dragParticleIDs.size())
++    // {
++    //     int particleID = simData.dragParticleIDs[0];
+         
+-        copyArrayToDevice(simData.d_dz, &simData.mouseDragSpeed[0], sizeof(float3) * particleID, sizeof(float3));
+-        Matrix33 zeroMat = Matrix33::Empty();
+-        copyArrayToDevice(simData.d_filter, &zeroMat, sizeof(Matrix33) * particleID, sizeof(Matrix33));
+-        Matrix33 IdentityMat = Matrix33::Identity();
+-        copyArrayToDevice(simData.d_I_S, &IdentityMat, sizeof(Matrix33) * particleID, sizeof(Matrix33));
++    //     copyArrayToDevice(simData.d_dz, &simData.mouseDragSpeed[0], sizeof(float3) * particleID, sizeof(float3));
++    //     Matrix33 zeroMat = Matrix33::Empty();
++    //     copyArrayToDevice(simData.d_filter, &zeroMat, sizeof(Matrix33) * particleID, sizeof(Matrix33));
++    //     Matrix33 IdentityMat = Matrix33::Identity();
++    //     copyArrayToDevice(simData.d_I_S, &IdentityMat, sizeof(Matrix33) * particleID, sizeof(Matrix33));
+         
+-        int filter_flag = 1;
+-        copyArrayToDevice(simData.d_filter_flags, &filter_flag, sizeof(int) * particleID, sizeof(int));
+-    }
++    //     int filter_flag = 1;
++    //     copyArrayToDevice(simData.d_filter_flags, &filter_flag, sizeof(int) * particleID, sizeof(int));
++    // }
+ 
+-    //printf("%#x\n", &zeroMat);
+-    //initialize velocity and force data
++    // //printf("%#x\n", &zeroMat);
++    // //initialize velocity and force data
+ 
+ 
+-    timer.start();
+-    InitVelocityForceArray(simData.numParticle, 
+-        simData.positions, simData.velocities, simData.d_v0, 
+-        simData.d_forces, params.gravity);
++    // timer.start();
++    // InitVelocityForceArray(simData.numParticle, 
++    //     simData.positions, simData.velocities, simData.d_v0, 
++    //     simData.d_forces, params.gravity);
+ 
+-    timer.end("InitVelocityForceArray");
++    // timer.end("InitVelocityForceArray");
+ 
+-    _applyWind(simData, params, h);
++    // _applyWind(simData, params, h);
+    
+-    GPUTimer constraint(GPUTimer::USE_CPU_TIMER);
+-    //constraint.start();
+-    _buildConstraints(simData, params);
+-    //UpdateForceArray(simData.numParticle, simData.arap_forces, simData.bending_forces, simData.sew_forces, simData.d_forces);
+-	//CCE
+-    //constraint.end("BuildConstraints");
++    // GPUTimer constraint(GPUTimer::USE_CPU_TIMER);
++    // //constraint.start();
++    // _buildConstraints(simData, params);
++    // //UpdateForceArray(simData.numParticle, simData.arap_forces, simData.bending_forces, simData.sew_forces, simData.d_forces);
++	// //CCE
++    // //constraint.end("BuildConstraints");
+ 
+     SparseMatrixCudaCollision spMatCollision;
+     PUSH_RANGE("SELF PROXIMITY", 1);
+@@ -107,27 +108,26 @@ void ConjugateGradientSolver::UpdateGPU(float deltaTime, bool bDynamic, VenusSim
+     POP_RANGE;
+ 
+     SparseMatrixCudaCollision spMatCmCollision;
+-    if (bDynamic)
+-        _discreateModelCollisionProximityForDynamic(simData, params, h);
+-    else
+-        _discreateModelCollisionProximityForStatic(simData, spMatCmCollision, params, h);
++    //     if (bDynamic)
++    //         _discreateModelCollisionProximityForDynamic(simData, params, h);
++    //     else
++    //         _discreateModelCollisionProximityForStatic(simData, spMatCmCollision, params, h);
+ 
+-    _groundProximity(simData, params, h);
++    //     _groundProximity(simData, params, h);
+ 
+-    //timer.start();
+-    //simData.spMat.applySortingPattern();
+-    //timer.end("Sorting");
++//     //timer.start();
++//     //simData.spMat.applySortingPattern();
++//     //timer.end("Sorting");
+ 
+ 
+-    timer.start();
+-    //simData.spMat.reduceSortedEntries();
+-    simData.spMat.calcReduceVal();
+-    timer.end("Reduction");
++ //     timer.start();
++ //     //simData.spMat.reduceSortedEntries();
++ //     simData.spMat.calcReduceVal();
++ //     timer.end("Reduction");
+     
+     timer.start();
+     PUSH_RANGE("Mix Collision", 0);
+ #if !MERGE_COLLISION_AND_NON_COLLISION_MATRIX
+-
+     SparseMatrixCudaMixCollision spMixCollision = SparseMatrixCudaMixCollision(simData.d_matCollisionBuffer[2], spMatCmCollision, spMatCollision);
+ #else
+     SparseMatrixCudaMixCollision spMixCollision = SparseMatrixCudaMixCollision(simData.d_matCollisionBuffer[2], simData.spMat, spMatCmCollision, spMatCollision);
+@@ -143,93 +143,105 @@ void ConjugateGradientSolver::UpdateGPU(float deltaTime, bool bDynamic, VenusSim
+     timer.end("MixCollision");
+ 
+     //GPUTimer cgtimer(GPUTimer::USE_CPU_TIMER);
+-    timer.start();
++    // timer.start();
+     //cgtimer.start();
+     simData.cgData.fillOnDiagonalPart(simData.d_M, simData.spMat.m_diaJacobiV, simData.spMat.m_diaJacobiX, deltaTime);
+     simData.cgData.fillOffDiagonalPart(simData.spMat.m_blockJacobiV, simData.spMat.m_blockJacobiX, deltaTime);
+     simData.cgData.fillColliOffDiagonalPart(spMixCollision.m_blockJacobiV, spMixCollision.m_blockJacobiX, deltaTime);
+-#if MERGE_COLLISION_AND_NON_COLLISION_MATRIX
+-    cudaMemset(simData.cgData.offDiaValPtr, 0, sizeof(Matrix33) * simData.cgData.m_nnzb);
+-#endif
+-    simData.cgData.fillb(simData.d_forces, simData.d_dz, simData.spMat.m_diaJacobiX, simData.spMat.m_blockJacobiX, spMixCollision.m_blockJacobiX,
+-        simData.d_v0, deltaTime, simData.d_filter);
+-    timer.end("Construct A and b");
+-    //cgtimer.end("Construct A and b");
+-
+-    timer.start();
+-    //cgtimer.start();
+-    m_solver.Solve(simData.cgData, simData.d_filter, simData.d_I_S, simData.d_dV, deltaTime, params.maxIter, params.residual, simData.d_dz);
+-    timer.end("CG Solver");
+-    //cgtimer.end("CG Solver");
+-    timer.start();
+-    if (spMatCmCollision.m_nnzb> 0)
+-    {
+-        spMatCmCollision.freeOffDiagonalEntries();
+-        if (spMixCollision.m_nnzb)
+-            spMixCollision.freeOffDiagonalEntries();
+-    }
+-
+-
+-    timer.end("free collison mat");
+-
+-    timer.start();
+-    UpdateVelocityArray(simData.numParticle, simData.velocities, simData.d_dV, simData.d_dz);
+-    //store the velocity
+-    copyD2D(simData.velocities, simData.velocitiesBeforeCCD, sizeof(float4)*simData.numParticle);
+-
+-    timer.end("Update Velocity");
+-    if (DEBUG_PID)
+-    {
+-        std::vector<float4> h_V(simData.numParticle);
+-        copyArrayFromDevice(h_V.data(), simData.velocities, sizeof(float4) * simData.numParticle);
+-        printf("[cst] before collision %f %f %f \n", h_V[DEBUG_PID].x, h_V[DEBUG_PID].y, h_V[DEBUG_PID].z);
+-    }
+-    _groundCCD(simData, params, h);
+-    //_selfCCD(simData, params, h);
+-
+-    if(bDynamic)
+-        _clothModelCCDForDynamic(simData, params, h);
+-    else
+-        _clothModelCCD(simData, params, h);
+-
+-
+-    if (DEBUG_PID)
+-    {
+-        std::vector<float4> h_V(simData.numParticle);
+-        copyArrayFromDevice(h_V.data(), simData.velocities, sizeof(float4) * simData.numParticle);
+-        printf("[cst] after collision %f %f %f \n", h_V[DEBUG_PID].x, h_V[DEBUG_PID].y, h_V[DEBUG_PID].z);
+-    }
+-	timer.start();
+-    UpdatePositionArray(simData.numParticle, simData.positions, simData.velocities, deltaTime);
+-    UpdateVelocityArrayWithFilter(simData.numParticle, simData.velocities, simData.d_filter);
+-	timer.end("update cloth position array");
+-    if (bDynamic)
+-    {
+-		timer.start();
+-        UpdateModelPositionArray(simData.d_numRigidVertex, simData.d_rigidVertices, simData.d_rigidVerticesVels, deltaTime);
+-        UpdateRigidEdgeNormals(simData.d_rigidVertices, simData.d_rigidTriangles, simData.d_numRigidEdge, simData.d_rigidEdgeInfos, simData.d_rigidEdgeNormals);
+-		timer.end("update model position array");
+-	}
+-	timer.start();
+-    if (params.bEnableSelfProximity)
+-    {
+-        _releaseSparseMatrixCollisionData(simData, spMatCollision);
+-    }
+-    timer.end("_releaseSparseMatrixCollisionData");
+-
+-    timer.start();
+-    if (bDynamic)
+-        _discreateModelCollisionUntangleForDynamic(simData, params, h);
+-    else
+-        _discreateModelCollisionUntangle(simData, params, h);
+-    timer.end("modelUntangle");
+ 
+-    timer.start();
+-    _selfUntangle(simData, params, h, gpuID);
++#if (DUMP_SPMAT_ALL == 1)
++            std::string fileName;
++            if (params.bEnableMultiGpu) {
++                fileName = sformat("G:/project_code/M2N/debug/spMat_device%d_", gpuID);
++            } else {
++                fileName = "G:/project_code/M2N/debug/spMat_singleGpu_";
++            }
++            dumpSpMat(simData.cgData, simData.particleRange, params.bEnableMultiGpu, fileName);
++#endif
+ 
+ 
+-    copyD2H(simData.positions, simData.vecPositionsBk.data(), sizeof(float4) * simData.numParticle);
+-    timer.end("selfUntangle");
++// #if MERGE_COLLISION_AND_NON_COLLISION_MATRIX
++//     cudaMemset(simData.cgData.offDiaValPtr, 0, sizeof(Matrix33) * simData.cgData.m_nnzb);
++// #endif
++//     simData.cgData.fillb(simData.d_forces, simData.d_dz, simData.spMat.m_diaJacobiX, simData.spMat.m_blockJacobiX, spMixCollision.m_blockJacobiX,
++//         simData.d_v0, deltaTime, simData.d_filter);
++//     timer.end("Construct A and b");
++//     //cgtimer.end("Construct A and b");
++
++//     timer.start();
++//     //cgtimer.start();
++//     m_solver.Solve(simData.cgData, simData.d_filter, simData.d_I_S, simData.d_dV, deltaTime, params.maxIter, params.residual, simData.d_dz);
++//     timer.end("CG Solver");
++//     //cgtimer.end("CG Solver");
++//     timer.start();
++//     if (spMatCmCollision.m_nnzb> 0)
++//     {
++//         spMatCmCollision.freeOffDiagonalEntries();
++//         if (spMixCollision.m_nnzb)
++//             spMixCollision.freeOffDiagonalEntries();
++//     }
++
++
++//     timer.end("free collison mat");
++
++//     timer.start();
++//     UpdateVelocityArray(simData.numParticle, simData.velocities, simData.d_dV, simData.d_dz);
++//     //store the velocity
++//     copyD2D(simData.velocities, simData.velocitiesBeforeCCD, sizeof(float4)*simData.numParticle);
++
++//     timer.end("Update Velocity");
++//     if (DEBUG_PID)
++//     {
++//         std::vector<float4> h_V(simData.numParticle);
++//         copyArrayFromDevice(h_V.data(), simData.velocities, sizeof(float4) * simData.numParticle);
++//         printf("[cst] before collision %f %f %f \n", h_V[DEBUG_PID].x, h_V[DEBUG_PID].y, h_V[DEBUG_PID].z);
++//     }
++//     _groundCCD(simData, params, h);
++//     //_selfCCD(simData, params, h);
++
++//     if(bDynamic)
++//         _clothModelCCDForDynamic(simData, params, h);
++//     else
++//         _clothModelCCD(simData, params, h);
++
++
++//     if (DEBUG_PID)
++//     {
++//         std::vector<float4> h_V(simData.numParticle);
++//         copyArrayFromDevice(h_V.data(), simData.velocities, sizeof(float4) * simData.numParticle);
++//         printf("[cst] after collision %f %f %f \n", h_V[DEBUG_PID].x, h_V[DEBUG_PID].y, h_V[DEBUG_PID].z);
++//     }
++// 	timer.start();
++//     UpdatePositionArray(simData.numParticle, simData.positions, simData.velocities, deltaTime);
++//     UpdateVelocityArrayWithFilter(simData.numParticle, simData.velocities, simData.d_filter);
++// 	timer.end("update cloth position array");
++//     if (bDynamic)
++//     {
++// 		timer.start();
++//         UpdateModelPositionArray(simData.d_numRigidVertex, simData.d_rigidVertices, simData.d_rigidVerticesVels, deltaTime);
++//         UpdateRigidEdgeNormals(simData.d_rigidVertices, simData.d_rigidTriangles, simData.d_numRigidEdge, simData.d_rigidEdgeInfos, simData.d_rigidEdgeNormals);
++// 		timer.end("update model position array");
++// 	}
++// 	timer.start();
++//     if (params.bEnableSelfProximity)
++//     {
++//         _releaseSparseMatrixCollisionData(simData, spMatCollision);
++//     }
++//     timer.end("_releaseSparseMatrixCollisionData");
++
++//     timer.start();
++//     if (bDynamic)
++//         _discreateModelCollisionUntangleForDynamic(simData, params, h);
++//     else
++//         _discreateModelCollisionUntangle(simData, params, h);
++//     timer.end("modelUntangle");
++
++//     timer.start();
++//     _selfUntangle(simData, params, h, gpuID);
++
++
++//     copyD2H(simData.positions, simData.vecPositionsBk.data(), sizeof(float4) * simData.numParticle);
++//     timer.end("selfUntangle");
+ }
+ 
+ 
+@@ -507,7 +519,7 @@ void ConjugateGradientSolver::_selfUntangle(VenusSimulationData & simData, const
+ void ConjugateGradientSolver::_selfProximity(VenusSimulationData & simData, SparseMatrixCudaCollision &spMatCollision, const VenusParameter& params, float h, int gpuID)
+ {
+ 
+-    if (params.bEnableSelfProximity )
++     if (params.bEnableSelfProximity)
+     {
+         GPUTimer timer;
+         timer.start();
+@@ -518,32 +530,53 @@ void ConjugateGradientSolver::_selfProximity(VenusSimulationData & simData, Spar
+ 
+             simData.pBroadPhaseLbvh->buildLbvhNode(0);
+ 
++#if (DUMP_SELF_PROXIMITY_BVH == 1)
++            std::string fileName;
++            if (params.bEnableMultiGpu) {
++                fileName = sformat("G:/project_code/M2N/debug/SelfProximity_lbvh_device%d.txt", gpuID);
++            } else {
++                fileName = "G:/project_code/M2N/debug/SelfProximity_lbvh_singleGpu.txt";
++            }
++            dumpSelfProximityLbvh(simData.pBroadPhaseLbvh, fileName);
++#endif
++
+             bool ncttFlag = ENABLE_NCTT ? true : false;
+-            if (params.bEnableMultiGpu)
+-            {
+-            	timer.start();
++
++            if (params.bEnableMultiGpu) {
++                timer.start();
+                 m_self_untangle_collision_num[gpuID] = simData.pBroadPhaseLbvh->generateCollisionPairMultiGpu(
+-                    simData.d_untangle_tt_group.collision_pair_,
+-            		simData.d_untangle_tt_group.collision_pair_max_length,
+-            		simData.d_untangle_tt_group.collision_pair_count_,
+-            		ncttFlag, simData.triangleIndices, simData.numTriangles, simData.triangleIdxList);
+-            	timer.end("_selfProximity generateCollisionPair");
++                                                simData.d_untangle_tt_group.collision_pair_,
++                                                simData.d_untangle_tt_group.collision_pair_max_length,
++                                                simData.d_untangle_tt_group.collision_pair_count_,
++                                                ncttFlag, simData.triangleIndices, simData.numTriangles, simData.triangleIdxList);
++                timer.end("_selfProximity generateCollisionPair");
++
++#if (DUMP_SELF_PROXIMITY_COLLISION_PAIR == 1)
++                std::string fileName = sformat("G:/project_code/M2N/debug/SelfProximity_CollisionPair_device%d.txt", gpuID);
++                dumpSelfProximityCollisionPair(simData, fileName, params.bEnableMultiGpu);
++#endif
++
+             } else {
+-            	timer.start();
++                timer.start();
+                 m_self_untangle_collision_num[gpuID] = simData.pBroadPhaseLbvh->generateCollisionPair(
+-                    simData.d_untangle_tt_group.collision_pair_,
+-            		simData.d_untangle_tt_group.collision_pair_max_length,
+-            		simData.d_untangle_tt_group.collision_pair_count_,
+-            		ncttFlag, simData.triangleIndices);
+-            	timer.end("_selfProximity generateCollisionPair");
+-            }
++                                                simData.d_untangle_tt_group.collision_pair_,
++                                                simData.d_untangle_tt_group.collision_pair_max_length,
++                                                simData.d_untangle_tt_group.collision_pair_count_,
++                                                ncttFlag, simData.triangleIndices);
++                timer.end("_selfProximity generateCollisionPair");
++
++#if (DUMP_SELF_PROXIMITY_COLLISION_PAIR == 1)
++                std::string fileName = "G:/project_code/M2N/debug/SelfProximity_CollisionPair_singleGPU.txt";
++                dumpSelfProximityCollisionPair(simData, fileName, params.bEnableMultiGpu);
++#endif
+ 
+-            if (NCTT_DEBUG)
+-            	{
+-            		simData.pBroadPhaseLbvh->searchNcttLevel(simData.m_treeId, simData.m_levelId, simData.m_nodeId);
+-            		simData.pBroadPhaseLbvh->addDebugNcttNode(simData.m_treeId, simData.m_nodeId);
+-            	}
+-            printf("[hw]proximity intesectionNum %d\n", m_self_untangle_collision_num[gpuID]);
++            }
++    
++            if (NCTT_DEBUG) {
++                simData.pBroadPhaseLbvh->searchNcttLevel(simData.m_treeId, simData.m_levelId, simData.m_nodeId);
++                simData.pBroadPhaseLbvh->addDebugNcttNode(simData.m_treeId, simData.m_nodeId);
++            }
++            printf("[hw]proximity intesectionNum %d\r\n", m_self_untangle_collision_num[gpuID]);
+             //timer.end("SelfCollision BoardPhase");
+         }
+ 
+@@ -561,16 +594,28 @@ void ConjugateGradientSolver::_selfProximity(VenusSimulationData & simData, Spar
+                 h, simData.d_triangleCollisionRadius, simData.d_untangle_tt_group.collision_pair_,
+                 m_self_untangle_collision_num[gpuID], simData.d_triangleInfos, simData.d_cutInfos, simData.d_sewPairArray, m_stream[6]);
+             POP_RANGE;
+-            //timer.end("CC Proximity narrowphase ");
++
++            int pointTriNum;
++            int EdgeEdgeNum;
++            cudaMemcpy(&pointTriNum, simData.m_selfCollisionProximity.m_dPointTriSpringNum, sizeof(int), cudaMemcpyDeviceToHost);
++            cudaMemcpy(&EdgeEdgeNum, simData.m_selfCollisionProximity.m_dEdgeEdgeSpringNum, sizeof(int), cudaMemcpyDeviceToHost);
++
++            timer.end("CC Proximity narrowphase ");
+             CCE;
+ 
++#if (DUMP_SELF_PROXIMITY_GENE_PROXIMITY == 1)
++            std::string prefix = "G:/project_code/M2N/debug/SelfProximity_GeneProximities_";
++            std::string fileName = params.bEnableMultiGpu ? (prefix + sformat("device%d.txt", gpuID)) : (prefix + "singleGPU.txt");
++            dumpSelfProximityGenerateProximities(simData, simData.m_selfCollisionProximity, fileName);
++#endif
++
+             //timer.start();
+             PUSH_RANGE("self proximity fill constraints", 2);
+             simData.m_selfCollisionProximity.GetCollisionSpringNum(&pointTriSpringNum, &edgeEdgeSpringNum);
+             pointTriSpringNum = venus_min(pointTriSpringNum, simData.pColliParams->maxPointTriSpringNum);
+             edgeEdgeSpringNum = venus_min(edgeEdgeSpringNum, simData.pColliParams->maxEdgeEdgeSpringNum);
+             //printf("(point tri: %d); (edge edge: %d)\n", pointTriSpringNum, edgeEdgeSpringNum);
+-			//printf("(maxPointTriSpringNum: %d); (maxEdgeEdgeSpringNum: %d)\n", simData.pColliParams->maxPointTriSpringNum, simData.pColliParams->maxEdgeEdgeSpringNum);
++            //printf("(maxPointTriSpringNum: %d); (maxEdgeEdgeSpringNum: %d)\n", simData.pColliParams->maxPointTriSpringNum, simData.pColliParams->maxEdgeEdgeSpringNum);
+             //initialize dynamic collision data
+ 
+             bool bCCProximityOverflow =
+@@ -586,6 +631,15 @@ void ConjugateGradientSolver::_selfProximity(VenusSimulationData & simData, Spar
+             POP_RANGE;
+             //timer.end("CC Proximity fill constraints");
+             CCE;
++
++#if (DUMP_SELF_PROXIMITY_SPARSE_MATRIX == 1)
++        {
++            std::string prefix = "G:/project_code/M2N/debug/SelfProximity_SparseMatrix_";
++            std::string fileName = params.bEnableMultiGpu ? (prefix + sformat("device%d_", gpuID)) : (prefix + "singleGPU_");
++            dumpSelfProximitySparseMatrix(spMatCollision, fileName);
++        }
++#endif
++
+         }
+         timer.end("selfProximity");
+     }
+@@ -947,7 +1001,6 @@ void ConjugateGradientSolver::_initSparseMatrixCollisionData(
+     }
+ }
+ 
+-
+ void ConjugateGradientSolver::_untangleClothModel( VenusSimulationData & simData,
+     const int collisionPairCount, const int iterations, const float factor)
+ {
+diff --git a/Solvers/VenusSolver/Core/DumpSelfProximity.h b/Solvers/VenusSolver/Core/DumpSelfProximity.h
+new file mode 100644
+index 00000000..8bb2a724
+--- /dev/null
++++ b/Solvers/VenusSolver/Core/DumpSelfProximity.h
+@@ -0,0 +1,370 @@
++#include <iostream>
++#include "VenusSimulationData.h"
++
++// in _selfProximity
++#define DUMP_SELF_PROXIMITY_BVH 0
++#define DUMP_SELF_PROXIMITY_COLLISION_PAIR 0
++#define DUMP_SELF_PROXIMITY_GENE_PROXIMITY 0
++#define DUMP_SELF_PROXIMITY_SPARSE_MATRIX 0
++
++// in UpdateGPU
++#define DUMP_SPMAT_ALL 1
++
++void dumpSelfProximityCollisionPair(VenusSimulationData& simData, std::string fileName, bool bEnableMultiGpu)
++{
++    int colliSize;
++    cudaMemcpy(&colliSize, simData.d_untangle_tt_group.collision_pair_count_, sizeof(int), cudaMemcpyDeviceToHost);
++    cudaDeviceSynchronize();
++
++    int2* tmp_colliPair = new int2[colliSize];
++    int3* tmp_triangleIndices = new int3[simData.numTriangles];
++
++    
++    copyD2H(simData.triangleIndices, tmp_triangleIndices, sizeof(int3) * simData.numTriangles);
++    CCE
++    copyD2H(simData.d_untangle_tt_group.collision_pair_, tmp_colliPair, sizeof(int2) * colliSize);
++    CCE
++
++    std::ofstream ofs(fileName.c_str());
++
++    ofs << sformat("[gnx debug]triangleIndices") << std::endl;
++    for (size_t i = 0; i < simData.numTriangles; i++)
++    {
++        std::string line;
++        int3 tri = tmp_triangleIndices[i];
++        line += sformat("id:%d [%d %d %d]", i, tri.x, tri.y, tri.z);
++        ofs << line << std::endl;
++    }
++
++    // // only for multiGPU
++    // if(bEnableMultiGpu){
++    //     int*  tmp_triangleIdxList = new int[simData.numTriangles];
++    //     copyD2H(simData.triangleIdxList, tmp_triangleIdxList, sizeof(int) * simData.numTriangles);
++    //     CCE
++    //     ofs << sformat("[gnx debug]triangleIdxList") << std::endl;
++    //     for (size_t i = 0; i < simData.numTriangles; i++)
++    //     {
++    //     std::string line;
++    //     int tri = tmp_triangleIdxList[i];
++    //     line += sformat("id:%d [%d]", i, tri);
++    //     ofs << line << std::endl;
++    //     }
++    //     delete[] tmp_triangleIdxList;
++    // }
++
++    ofs << sformat("[gnx debug]self proximity collision pair") << std::endl;
++    for (size_t i = 0; i < colliSize; i++)
++    {
++        std::string line;
++        int2 pair = tmp_colliPair[i];
++        line += sformat("id:%d [%d %d]", i, pair.x, pair.y);
++        // line += sformat("[%d %d]", pair.x, pair.y);
++        ofs << line << std::endl;
++    }
++
++    delete[] tmp_triangleIndices;
++    delete[] tmp_colliPair;
++
++    ofs.close();
++}
++
++void dumpSelfProximityGenerateProximities(VenusSimulationData& simData, SelfCollisionProximityHandler& handler, std::string fileName)
++{
++    int pointTriNum;
++    int EdgeEdgeNum;
++    cudaMemcpy(&pointTriNum, handler.m_dPointTriSpringNum, sizeof(int), cudaMemcpyDeviceToHost);
++    cudaMemcpy(&EdgeEdgeNum, handler.m_dEdgeEdgeSpringNum, sizeof(int), cudaMemcpyDeviceToHost);
++
++    CollisionSpring* pointTriSprings = new CollisionSpring[pointTriNum];
++    CollisionSpring* edgeEdgeSprings = new CollisionSpring[EdgeEdgeNum];
++    CCE
++    copyD2H(handler.m_dPointTriSprings, pointTriSprings, sizeof(CollisionSpring) * pointTriNum);
++    CCE
++    copyD2H(handler.m_dEdgeEdgeSprings, edgeEdgeSprings, sizeof(CollisionSpring) * EdgeEdgeNum);
++    CCE
++
++    std::ofstream ofs(fileName.c_str());
++    ofs << sformat("[gnx debug] pointTriSprings") << std::endl;
++    for (size_t i = 0; i < pointTriNum; i++)
++    {
++        std::string line;
++        CollisionSpring pt = pointTriSprings[i];
++
++        line += sformat("id:%d, _indexQuad[%d %d %d %d], _baryc[%f %f %f %f], _collisionDis %f, _friction %f, _collisionArea %f, _penetrating %d",
++        i, 
++        pt._indexQuad.x, pt._indexQuad.y, pt._indexQuad.z, pt._indexQuad.w,
++        pt._baryc.x, pt._baryc.y, pt._baryc.z, pt._baryc.w,
++        pt._collisionDis,
++        pt._friction,
++        pt._collisionArea,
++        (int)pt._penetrating);
++
++        ofs << line << std::endl;
++    }
++
++    ofs << sformat("[gnx debug] edgeEdgeSprings") << std::endl;
++    for (size_t i = 0; i < EdgeEdgeNum; i++)
++    {
++        std::string line;
++        CollisionSpring ee = edgeEdgeSprings[i];
++
++        line += sformat("id:%d, _indexQuad[%d %d %d %d], _baryc[%f %f %f %f], _collisionDis %f, _friction %f, _collisionArea %f, _penetrating %d",
++        i, 
++        ee._indexQuad.x, ee._indexQuad.y, ee._indexQuad.z, ee._indexQuad.w,
++        ee._baryc.x, ee._baryc.y, ee._baryc.z, ee._baryc.w,
++        ee._collisionDis,
++        ee._friction,
++        ee._collisionArea,
++        (int)ee._penetrating);
++
++        ofs << line << std::endl;
++    }
++
++    delete[] pointTriSprings;
++    delete[] edgeEdgeSprings;
++    ofs.close();
++}
++
++void dumpSelfProximityLbvh(BroadPhaseLbvh* lbvh, std::string fileName)
++{
++    int allNodeNum = lbvh->m_numClothPrimitive * 2 - 1;
++    LbvhNode* allNode = new LbvhNode[allNodeNum];
++    copyD2H(lbvh->m_dClothLeafNode, allNode, sizeof(LbvhNode) * allNodeNum);
++    CCE
++
++    LbvhNode* leafNode = allNode;
++    LbvhNode* interiorNode = leafNode + lbvh->m_numClothPrimitive;
++
++    std::ofstream ofs(fileName.c_str());
++
++    ofs << sformat("[gnx debug] leafNode") << std::endl;
++    for (size_t i = 0; i < lbvh->m_numClothPrimitive; i++)
++    {
++        std::string line;
++        LbvhNode leaf = leafNode[i];
++
++        line += sformat("id:%d, particle_idx[%d], left_child_idx[%lld], right_child_idx[%lld], parent_idx[%lld], bounding_box[min[%f,%f,%f],max[%f,%f,%f]], atomic[%d], index[%d], rangeLeft[%d], rangeRight[%d]",
++        i,
++        leaf.particle_idx,
++        leaf.left_child_idx,
++        leaf.right_child_idx,
++        leaf.parent_idx,
++        leaf.bounding_box._min.x, leaf.bounding_box._min.y, leaf.bounding_box._min.z, leaf.bounding_box._max.x, leaf.bounding_box._max.y, leaf.bounding_box._max.z,
++        leaf.atomic,
++        leaf.index,
++        leaf.rangeLeft,
++        leaf.rangeRight);
++
++        ofs << line << std::endl;
++    }
++
++    ofs << sformat("[gnx debug] interiorNode") << std::endl;
++    for (size_t i = 0; i < lbvh->m_numClothPrimitive - 1; i++)
++    {
++        std::string line;
++        LbvhNode leaf = interiorNode[i];
++
++        line += sformat("id:%d, particle_idx[%d], left_child_idx[%lld], right_child_idx[%lld], parent_idx[%lld], bounding_box[min[%f,%f,%f],max[%f,%f,%f]], atomic[%d], index[%d], rangeLeft[%d], rangeRight[%d]",
++        i,
++        leaf.particle_idx,
++        leaf.left_child_idx,
++        leaf.right_child_idx,
++        leaf.parent_idx,
++        leaf.bounding_box._min.x, leaf.bounding_box._min.y, leaf.bounding_box._min.z, leaf.bounding_box._max.x, leaf.bounding_box._max.y, leaf.bounding_box._max.z,
++        leaf.atomic,
++        leaf.index,
++        leaf.rangeLeft,
++        leaf.rangeRight);
++
++        ofs << line << std::endl;
++    }
++
++
++    // float* collisionRadius = new float[lbvh->m_numClothPrimitive];
++    // copyD2H(lbvh->m_dClothCollisionRadius, collisionRadius, sizeof(float) * lbvh->m_numClothPrimitive);
++    // CCE
++    // ofs << sformat("[gnx debug] Cloth Collision Radius") << std::endl;
++    // for (size_t i = 0; i < lbvh->m_numClothPrimitive; i++)
++    // {
++    //     std::string line;
++    //     float radius = collisionRadius[i];
++    //     line += sformat("id:%d, collisionRadius [%d]", i, radius);
++    //     ofs << line << std::endl;
++    // }
++    // delete[] collisionRadius;
++
++
++    // float4* clothVel = new float4[lbvh->m_numClothParticle];
++    // copyD2H(lbvh->m_dClothVel, clothVel, sizeof(float4) * lbvh->m_numClothParticle);
++    // CCE
++    // ofs << sformat("[gnx debug] m_dClothVel") << std::endl;
++    // for (size_t i = 0; i < lbvh->m_numClothParticle; i++)
++    // {
++    //     std::string line;
++    //     float4 vel = clothVel[i];
++    //     line += sformat("id:%d, vel [%f, %f, %f, %f]", i, vel.x, vel.y, vel.z, vel.w);
++    //     ofs << line << std::endl;
++    // }
++    // delete[] clothVel;
++
++
++    delete[] allNode;
++
++    ofs.close();
++}
++
++void dumpSelfProximitySparseMatrix(SparseMatrixCudaCollision spMatCollision, std::string fileName)
++{
++    std::string offDiagJacobiXFileName = fileName + "offDiagJacobiX.txt";
++    std::string offDiagJacobiVFileName = fileName + "offDiagJacobiV.txt";
++
++    int numAll = spMatCollision.m_numOffDiaEntries_PointTri + spMatCollision.m_numOffDiaEntries_EdgeEdge;
++    Matrix33* offDiagJacobiX = new Matrix33[numAll];
++    Matrix33* offDiagJacobiV = new Matrix33[numAll];
++
++    copyD2H(spMatCollision.m_blockJacobiX, offDiagJacobiX, sizeof(Matrix33) * numAll);
++    CCE
++    copyD2H(spMatCollision.m_blockJacobiV, offDiagJacobiV, sizeof(Matrix33) * numAll);
++    CCE
++
++
++////// offDiagJacobiX
++    std::ofstream ofsX(offDiagJacobiXFileName.c_str());
++    ofsX << sformat("[gnx debug] offDiagJacobiX_PointTri") << std::endl;
++    size_t i = 0;
++    for (; i < spMatCollision.m_numOffDiaEntries_PointTri; i++)
++    {
++        std::string line;
++        Matrix33 item = offDiagJacobiX[i];
++        for (size_t j = 0; j < 3; j++) {
++            line += sformat("%.10f %.10f %.10f ", item.cols[j].x, item.cols[j].y, item.cols[j].z);
++        }
++        ofsX << line << std::endl;
++    }
++    ofsX << sformat("[gnx debug] offDiagJacobiX_EdgeEdge") << std::endl;
++    for (; i < numAll; i++)
++    {
++        std::string line;
++        Matrix33 item = offDiagJacobiX[i];
++        for (size_t j = 0; j < 3; j++) {
++            line += sformat("%.10f %.10f %.10f ", item.cols[j].x, item.cols[j].y, item.cols[j].z);
++        }
++        ofsX << line << std::endl;
++    }
++
++    ofsX.close();
++    
++////// offDiagJacobiV
++    std::ofstream ofsV(offDiagJacobiVFileName.c_str());
++    ofsV << sformat("[gnx debug] offDiagJacobiV_PointTri") << std::endl;
++    i = 0;
++    for (; i < spMatCollision.m_numOffDiaEntries_PointTri; i++)
++    {
++        std::string line;
++        Matrix33 item = offDiagJacobiV[i];
++        for (size_t j = 0; j < 3; j++) {
++            line += sformat("%.10f %.10f %.10f ", item.cols[j].x, item.cols[j].y, item.cols[j].z);
++        }
++        ofsV << line << std::endl;
++    }
++    ofsV << sformat("[gnx debug] offDiagJacobiV_EdgeEdge") << std::endl;
++    for (; i < numAll; i++)
++    {
++        std::string line;
++        Matrix33 item = offDiagJacobiV[i];
++        for (size_t j = 0; j < 3; j++) {
++            line += sformat("%.10f %.10f %.10f ", item.cols[j].x, item.cols[j].y, item.cols[j].z);
++        }
++        ofsV << line << std::endl;
++    }
++    ofsV.close();
++
++    delete[] offDiagJacobiX;
++    delete[] offDiagJacobiV;
++}
++
++
++void dumpSpMat(VenusCGData cgData, int2 particleRange, bool enableMultiGpu, std::string fileName)
++{
++    
++    int* rowColliPtr = new int[cgData.m_nb + 1];
++    // int* colColliIndexPtr = new int[cgData.m_colli_nnzb];
++    copyD2H(cgData.rowColliPtr, rowColliPtr, sizeof(int) * (cgData.m_nb + 1));
++    CCE
++    // copyD2H(cgData.colColliIndexPtr, colColliIndexPtr, sizeof(int) * cgData.m_colli_nnzb);
++    // CCE
++    int low = enableMultiGpu ? particleRange.x : 0;
++    int up = enableMultiGpu ? (particleRange.x + particleRange.y) : cgData.m_nb;
++
++// constriant onDia
++    Matrix33* onDiaValPtr = new Matrix33[cgData.m_nb];
++    copyD2H(cgData.onDiaValPtr, onDiaValPtr, sizeof(Matrix33) * cgData.m_nb);
++    CCE
++    std::string onDiaName = fileName + "onDia.txt";
++    std::ofstream output1(onDiaName.c_str());
++    output1 << sformat("[gnx debug] offDiaColliValPtr") << std::endl;
++    for (int i = low; i < up; i++) {
++        int lineSize = rowColliPtr[i+1] - rowColliPtr[i];
++        for(int j = 0; j < lineSize; ++j) { /* 第i行的第j个非零值 */
++            int offset = rowColliPtr[i];
++            Matrix33 jacobi = onDiaValPtr[offset + j];
++            std::string line;
++            line += sformat("%d, %d ", i ,j);
++            for (size_t j = 0; j < 3; j++) {
++                line += sformat("%.10f %.10f %.10f ", jacobi.cols[j].x, jacobi.cols[j].y, jacobi.cols[j].z);
++            }
++            output1 << line << std::endl;
++        }
++    }
++    output1.close();
++
++// constriant offDia
++    Matrix33* offDiaValPtr = new Matrix33[cgData.m_nnzb];
++    copyD2H(cgData.offDiaValPtr, offDiaValPtr, sizeof(Matrix33) * cgData.m_nnzb);
++    CCE
++    std::string offDiaName = fileName + "offDia.txt";
++    std::ofstream output2(offDiaName.c_str());
++    output2 << sformat("[gnx debug] offDiaValPtr") << std::endl;
++    for (int i = low; i < up; i++) {
++        int lineSize = rowColliPtr[i+1] - rowColliPtr[i];
++        for(int j = 0; j < lineSize; ++j) { /* 第i行的第j个非零值 */
++            int offset = rowColliPtr[i];
++            Matrix33 jacobi = onDiaValPtr[offset + j];
++            std::string line;
++            line += sformat("%d, %d ", i ,j);
++            for (size_t j = 0; j < 3; j++) {
++                line += sformat("%.10f %.10f %.10f ", jacobi.cols[j].x, jacobi.cols[j].y, jacobi.cols[j].z);
++            }
++            output2 << line << std::endl;
++        }
++    }
++    output2.close();
++
++    // selfproximity collision
++    Matrix33* offDiaColliValPtr = new Matrix33[cgData.m_colli_nnzb];
++    copyD2H(cgData.offDiaColliValPtr, offDiaColliValPtr, sizeof(Matrix33) * cgData.m_colli_nnzb);
++    CCE
++    std::string offDiaColliName = fileName + "offDiaCollision.txt";
++    std::ofstream output3(offDiaColliName.c_str());
++    output3 << sformat("[gnx debug] offDiaColliValPtr") << std::endl;
++    for (int i = low; i < up; i++) {
++        int lineSize = rowColliPtr[i+1] - rowColliPtr[i];
++        for(int j = 0; j < lineSize; ++j) { /* 第i行的第j个非零值 */
++            int offset = rowColliPtr[i];
++            Matrix33 jacobi = offDiaColliValPtr[offset + j];
++            std::string line;
++            line += sformat("%d, %d ", i ,j);
++            for (size_t j = 0; j < 3; j++) {
++                line += sformat("%.10f %.10f %.10f ", jacobi.cols[j].x, jacobi.cols[j].y, jacobi.cols[j].z);
++            }
++            output3 << line << std::endl;
++        }
++    }
++    output3.close();
++
++    delete[] onDiaValPtr;
++    delete[] offDiaValPtr;
++    delete[] rowColliPtr;
++    // delete[] colColliIndexPtr;
++    delete[] offDiaColliValPtr;
++}
+diff --git a/Solvers/VenusSolver/Core/VenusParameters.h b/Solvers/VenusSolver/Core/VenusParameters.h
+index 7336c357..81dc8c88 100644
+--- a/Solvers/VenusSolver/Core/VenusParameters.h
++++ b/Solvers/VenusSolver/Core/VenusParameters.h
+@@ -17,7 +17,7 @@ struct VenusParameter
+ 
+     float airDamping = 0.01f;  /** viscosity of air  */
+ 
+-    bool bEnableMultiGpu = false;
++    bool bEnableMultiGpu = 1;
+ 
+     bool bEnableSelfProximity = false;
+     bool bEnableSelfCCD = false;
+diff --git a/Solvers/VenusSolver/Dynamics/SelfCollisionProximityHandler.h b/Solvers/VenusSolver/Dynamics/SelfCollisionProximityHandler.h
+index 70f02fcc..17a9fcdb 100644
+--- a/Solvers/VenusSolver/Dynamics/SelfCollisionProximityHandler.h
++++ b/Solvers/VenusSolver/Dynamics/SelfCollisionProximityHandler.h
+@@ -40,7 +40,8 @@ protected:
+     void _initialize();
+     void _finalize();
+ 
+-private:
++//private:
++public:
+     //CollisionParams* hostParams;
+     //external pointers
+     uint m_numPositions;
+diff --git a/Solvers/VenusSolver/Lbvh/lbvh.h b/Solvers/VenusSolver/Lbvh/lbvh.h
+index cc8a0c56..f9df5f7c 100644
+--- a/Solvers/VenusSolver/Lbvh/lbvh.h
++++ b/Solvers/VenusSolver/Lbvh/lbvh.h
+@@ -44,7 +44,8 @@ struct LbvhNode {
+ 
+ //reference:https://devblogs.nvidia.com/wp-content/uploads/2012/11/karras2012hpg_paper.pdf
+ class BroadPhaseLbvh {
+-private:
++//private:
++public:
+     //input data
+     uint m_numClothParticle;
+     float4 * m_dClothPos = nullptr;
+diff --git a/full/code/Plugins/SimulationScene/SimulationScene.cpp b/full/code/Plugins/SimulationScene/SimulationScene.cpp
+index d3224f5b..7ee6fd23 100644
+--- a/full/code/Plugins/SimulationScene/SimulationScene.cpp
++++ b/full/code/Plugins/SimulationScene/SimulationScene.cpp
+@@ -47,7 +47,8 @@ void SimulationScene::OnInitScene()
+ 
+     //gltf scene
+     std::vector<SPIDeformEntity> vecEntitis;
+-    std::string gltf = SingletonService<ISystem>::Get()->GetResDir() + "scene/sceneGltf/hanfu/hanfu.gltf";
++     std::string gltf = SingletonService<ISystem>::Get()->GetResDir() + "scene/sceneGltf/hanfu/hanfu.gltf";
++    //std::string gltf = SingletonService<ISystem>::Get()->GetResDir() + "scene/sceneGltf/chajiangltf/chajian.gltf";  
+     //std::string gltf = SingletonService<ISystem>::Get()->GetResDir() + "scene/sceneGltf/zrzGLTF.gltf";
+     vecEntitis = entLoader->CreateClothEntityFromGltf(gltf);
+     for (auto item : vecEntitis)
+@@ -59,7 +60,8 @@ void SimulationScene::OnInitScene()
+ //    SPIRigidModel spRigid = entLoader->CreateRigidEntityFromObj(rigidObj);
+ //    entMgr->AddEntity(spRigid);
+ 
+-    std::string rigidFbx = SingletonService<ISystem>::Get()->GetResDir() + "scene/sceneGltf/bvh_covert23_delete_60f_g.fbx";
++     std::string rigidFbx = SingletonService<ISystem>::Get()->GetResDir() + "scene/sceneGltf/bvh_covert23_delete_60f_g.fbx";
++    //std::string rigidFbx = SingletonService<ISystem>::Get()->GetResDir() + "scene/sceneGltf/hair_body_low_Mb_catwalk5_Max_wutou.fbx";
+     SPIRigidModel spRigid = entLoader->CreateRigidEntityFromFbx(rigidFbx, 10.f);
+     entMgr->AddEntity(spRigid);
+ 
+-- 
+2.36.1.windows.1
