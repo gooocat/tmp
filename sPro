@@ -1,0 +1,779 @@
+From 0616cb7b374e914e6fdb4a722db28b1bf70e826f Mon Sep 17 00:00:00 2001
+From: g00513643 <gongnanxue@huawei.com>
+Date: Fri, 9 Jun 2023 09:28:08 +0800
+Subject: [PATCH] split self proximity
+
+---
+ .../Core/ConjugateGradientSolver.cpp          |  74 ++++----
+ .../Core/ConjugateGradientSolver.h            |   8 +-
+ Solvers/VenusSolver/Core/VenusParameters.h    |   2 +
+ .../VenusSolver/Core/VenusSimulationData.h    |  64 ++++---
+ Solvers/VenusSolver/Core/VenusSolverData.cpp  |  33 +++-
+ Solvers/VenusSolver/Lbvh/lbvh.cpp             |  53 ++++++
+ Solvers/VenusSolver/Lbvh/lbvh.cu              | 174 ++++++++++++++++++
+ Solvers/VenusSolver/Lbvh/lbvh.cuh             |   8 +
+ Solvers/VenusSolver/Lbvh/lbvh.h               |   5 +-
+ .../VenusSolver/untangle/global_untangle.cu   |   2 +-
+ 10 files changed, 345 insertions(+), 78 deletions(-)
+
+diff --git a/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp b/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp
+index 446f61da..b21e474e 100644
+--- a/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp
++++ b/Solvers/VenusSolver/Core/ConjugateGradientSolver.cpp
+@@ -52,7 +52,7 @@ ConjugateGradientSolver::~ConjugateGradientSolver()
+     }
+ }
+ 
+-void ConjugateGradientSolver::UpdateGPU(float deltaTime, bool bDynamic, VenusSimulationData & simData, const VenusParameter & params, VenusHostData & hostInitData)
++void ConjugateGradientSolver::UpdateGPU(float deltaTime, bool bDynamic, VenusSimulationData & simData, const VenusParameter & params, VenusHostData & hostInitData, int gpuID)
+ {
+ 
+     float h = deltaTime;
+@@ -103,7 +103,7 @@ void ConjugateGradientSolver::UpdateGPU(float deltaTime, bool bDynamic, VenusSim
+ 
+     SparseMatrixCudaCollision spMatCollision;
+     PUSH_RANGE("SELF PROXIMITY", 1);
+-    _selfProximity(simData, spMatCollision, params, h);
++    _selfProximity(simData, spMatCollision, params, h, gpuID);
+     POP_RANGE;
+ 
+     SparseMatrixCudaCollision spMatCmCollision;
+@@ -225,7 +225,7 @@ void ConjugateGradientSolver::UpdateGPU(float deltaTime, bool bDynamic, VenusSim
+     timer.end("modelUntangle");
+ 
+     timer.start();
+-    _selfUntangle(simData, params, h);
++    _selfUntangle(simData, params, h, gpuID);
+ 
+ 
+     copyD2H(simData.positions, simData.vecPositionsBk.data(), sizeof(float4) * simData.numParticle);
+@@ -431,7 +431,7 @@ void ConjugateGradientSolver::_groundCCD(VenusSimulationData & simData, const Ve
+ 
+ }
+ 
+-void ConjugateGradientSolver::_selfUntangle(VenusSimulationData & simData, const VenusParameter& params, float h)
++void ConjugateGradientSolver::_selfUntangle(VenusSimulationData & simData, const VenusParameter& params, float h, int gpuID)
+ {
+ 
+     if (/*params.bEnableSelfProximity || */params.bEnableSelfUntangle)
+@@ -489,22 +489,22 @@ void ConjugateGradientSolver::_selfUntangle(VenusSimulationData & simData, const
+         printf("[hw]Untangle intesectionNum %d\n", intesectionNum);
+         //timer.end("SelfCollision BoardPhase");
+ 
+-        m_self_untangle_collision_num = venus_min(intesectionNum, simData.d_untangle_tt_group.collision_pair_max_length);
+-        bool bCCOverflow = m_self_untangle_collision_num == simData.d_untangle_tt_group.collision_pair_max_length;
++        m_self_untangle_collision_num[gpuID] = venus_min(intesectionNum, simData.d_untangle_tt_group.collision_pair_max_length);
++        bool bCCOverflow = m_self_untangle_collision_num[gpuID] == simData.d_untangle_tt_group.collision_pair_max_length;
+         CCE
+-        if (params.bEnableSelfUntangle && m_self_untangle_collision_num && !bCCOverflow)
++        if (params.bEnableSelfUntangle && m_self_untangle_collision_num[gpuID] && !bCCOverflow)
+         {
+             //printf("intersection num : %d\n", intersectionNum);
+             timer.start();
+             int iterations = 5;
+             float step = 0.5f;
+-            _untangleCloth(simData, m_self_untangle_collision_num, iterations, step);
++            _untangleCloth(simData, m_self_untangle_collision_num[gpuID], iterations, step);
+             timer.end("CC Untangle");
+         }
+     }
+ 
+ }
+-void ConjugateGradientSolver::_selfProximity(VenusSimulationData & simData, SparseMatrixCudaCollision &spMatCollision, const VenusParameter& params, float h)
++void ConjugateGradientSolver::_selfProximity(VenusSimulationData & simData, SparseMatrixCudaCollision &spMatCollision, const VenusParameter& params, float h, int gpuID)
+ {
+ 
+     if (params.bEnableSelfProximity )
+@@ -513,51 +513,53 @@ void ConjugateGradientSolver::_selfProximity(VenusSimulationData & simData, Spar
+         timer.start();
+         // proximity check
+         //first frame
+-        if(!m_self_untangle_collision_num) {
++        if(!m_self_untangle_collision_num[gpuID]) {
+             cudaMemset(simData.d_untangle_tt_group.collision_pair_count_, 0, sizeof(int));
+ 
+             simData.pBroadPhaseLbvh->buildLbvhNode(0);
+ 
+-            if (ENABLE_NCTT)
++            bool ncttFlag = ENABLE_NCTT ? true : false;
++            if (params.bEnableMultiGpu)
+             {
+             	timer.start();
+-                m_self_untangle_collision_num = simData.pBroadPhaseLbvh->generateCollisionPair(simData.d_untangle_tt_group.collision_pair_,
++                m_self_untangle_collision_num[gpuID] = simData.pBroadPhaseLbvh->generateCollisionPairMultiGpu(
++                    simData.d_untangle_tt_group.collision_pair_,
+             		simData.d_untangle_tt_group.collision_pair_max_length,
+             		simData.d_untangle_tt_group.collision_pair_count_,
+-            		true, simData.triangleIndices);
++            		ncttFlag, simData.triangleIndices, simData.numTriangles, simData.triangleIdxList);
+             	timer.end("_selfProximity generateCollisionPair");
+-            	if (NCTT_DEBUG)
+-            	{
+-            		simData.pBroadPhaseLbvh->searchNcttLevel(simData.m_treeId, simData.m_levelId, simData.m_nodeId);
+-            		simData.pBroadPhaseLbvh->addDebugNcttNode(simData.m_treeId, simData.m_nodeId);
+-            	}
+-            }
+-            else
+-            {
++            } else {
+             	timer.start();
+-                m_self_untangle_collision_num = simData.pBroadPhaseLbvh->generateCollisionPair(simData.d_untangle_tt_group.collision_pair_,
++                m_self_untangle_collision_num[gpuID] = simData.pBroadPhaseLbvh->generateCollisionPair(
++                    simData.d_untangle_tt_group.collision_pair_,
+             		simData.d_untangle_tt_group.collision_pair_max_length,
+             		simData.d_untangle_tt_group.collision_pair_count_,
+-            		false, simData.triangleIndices);
++            		ncttFlag, simData.triangleIndices);
+             	timer.end("_selfProximity generateCollisionPair");
+             }
+-                  printf("[hw]proximity intesectionNum %d\n", m_self_untangle_collision_num);
+-                  //timer.end("SelfCollision BoardPhase");
++
++            if (NCTT_DEBUG)
++            	{
++            		simData.pBroadPhaseLbvh->searchNcttLevel(simData.m_treeId, simData.m_levelId, simData.m_nodeId);
++            		simData.pBroadPhaseLbvh->addDebugNcttNode(simData.m_treeId, simData.m_nodeId);
++            	}
++            printf("[hw]proximity intesectionNum %d\n", m_self_untangle_collision_num[gpuID]);
++            //timer.end("SelfCollision BoardPhase");
+         }
+ 
+   //      int selfIntersectionPairNum = venus_min(intesectionNum, simData.d_untangle_tt_group.collision_pair_max_length);
+-        bool bCCOverflow = m_self_untangle_collision_num == simData.d_untangle_tt_group.collision_pair_max_length;
++        bool bCCOverflow = m_self_untangle_collision_num[gpuID] == simData.d_untangle_tt_group.collision_pair_max_length;
+   //      CCE
+ 
+         int pointTriSpringNum = 0;
+         int edgeEdgeSpringNum = 0;
+-        if (params.bEnableSelfProximity && m_self_untangle_collision_num && !bCCOverflow)
++        if (params.bEnableSelfProximity && m_self_untangle_collision_num[gpuID] && !bCCOverflow)
+         {
+             timer.start();
+             PUSH_RANGE("generate self proximity", 2);
+             simData.m_selfCollisionProximity.GenerateProximities(
+                 h, simData.d_triangleCollisionRadius, simData.d_untangle_tt_group.collision_pair_,
+-                m_self_untangle_collision_num, simData.d_triangleInfos, simData.d_cutInfos, simData.d_sewPairArray, m_stream[6]);
++                m_self_untangle_collision_num[gpuID], simData.d_triangleInfos, simData.d_cutInfos, simData.d_sewPairArray, m_stream[6]);
+             POP_RANGE;
+             //timer.end("CC Proximity narrowphase ");
+             CCE;
+@@ -665,14 +667,14 @@ void  ConjugateGradientSolver::_buildConstraints(VenusSimulationData & simData,
+         offDiagonalBlockOffset += simData.spMat.m_numOffDiaEntries_stretch_uv;
+     }
+ 
+-    if (simData.numTriangles)
+-    {
+-        FillVolumeBlockDerivativesH(
+-            simData.numTriangles, onDiagnoalBlockOffset, simData.triangleIndices,
+-            simData.positions, simData.d_forces, simData.triangleDmLenth, simData.triPressureArray,
+-            simData.spMat.m_onDiaBlockJacobiX, m_stream[2]);
+-        onDiagnoalBlockOffset += simData.spMat.m_numOnDiaEntries_volume;
+-    }
++    // if (simData.numTriangles)
++    // {
++    //     FillVolumeBlockDerivativesH(
++    //         simData.numTriangles, onDiagnoalBlockOffset, simData.triangleIndices,
++    //         simData.positions, simData.d_forces, simData.triangleDmLenth, simData.triPressureArray,
++    //         simData.spMat.m_onDiaBlockJacobiX, m_stream[2]);
++    //     onDiagnoalBlockOffset += simData.spMat.m_numOnDiaEntries_volume;
++    // }
+ 
+ 
+ 
+diff --git a/Solvers/VenusSolver/Core/ConjugateGradientSolver.h b/Solvers/VenusSolver/Core/ConjugateGradientSolver.h
+index 7e3e6114..840df1a5 100644
+--- a/Solvers/VenusSolver/Core/ConjugateGradientSolver.h
++++ b/Solvers/VenusSolver/Core/ConjugateGradientSolver.h
+@@ -17,7 +17,7 @@ public:
+     ConjugateGradientSolver();
+     ~ConjugateGradientSolver();
+ 
+-     void UpdateGPU(float deltaTime,bool bDynamic, VenusSimulationData& simData, const VenusParameter& params, VenusHostData& hostInitData);
++     void UpdateGPU(float deltaTime,bool bDynamic, VenusSimulationData& simData, const VenusParameter& params, VenusHostData& hostInitData, int gpuID);
+ 
+ 
+ 
+@@ -51,8 +51,8 @@ private:
+     void _discreateModelCollisionProximityForStatic(VenusSimulationData & simData, SparseMatrixCudaCollision &spMatCollision, const VenusParameter& params, float h);
+ 
+ 
+-    void _selfUntangle(VenusSimulationData & simData, const VenusParameter& params, float h);
+-    void _selfProximity(VenusSimulationData & simData, SparseMatrixCudaCollision &spMatCollision, const VenusParameter& params, float h);
++    void _selfUntangle(VenusSimulationData & simData, const VenusParameter& params, float h, int gpuID);
++    void _selfProximity(VenusSimulationData & simData, SparseMatrixCudaCollision &spMatCollision, const VenusParameter& params, float h, int gpuID);
+     void _groundProximity(VenusSimulationData & simData, const VenusParameter& params, float h);
+ 
+     void _applyWind(VenusSimulationData & simData, const VenusParameter& params, float h);
+@@ -73,6 +73,6 @@ private:
+     bool _isSemiPositiveHessian12(std::vector<Matrix33> &hessianMatrix);
+ 
+ private:
+-    int m_self_untangle_collision_num = 0;
++    int m_self_untangle_collision_num[2] = {0, 0};
+     cudaStream_t m_stream[15];
+ };
+\ No newline at end of file
+diff --git a/Solvers/VenusSolver/Core/VenusParameters.h b/Solvers/VenusSolver/Core/VenusParameters.h
+index 1b84a7e8..7336c357 100644
+--- a/Solvers/VenusSolver/Core/VenusParameters.h
++++ b/Solvers/VenusSolver/Core/VenusParameters.h
+@@ -17,6 +17,8 @@ struct VenusParameter
+ 
+     float airDamping = 0.01f;  /** viscosity of air  */
+ 
++    bool bEnableMultiGpu = false;
++
+     bool bEnableSelfProximity = false;
+     bool bEnableSelfCCD = false;
+     bool bEnableSelfUntangle = false;
+diff --git a/Solvers/VenusSolver/Core/VenusSimulationData.h b/Solvers/VenusSolver/Core/VenusSimulationData.h
+index c1572308..f9bb3641 100644
+--- a/Solvers/VenusSolver/Core/VenusSimulationData.h
++++ b/Solvers/VenusSolver/Core/VenusSimulationData.h
+@@ -31,6 +31,11 @@ struct VenusSimulationCoreData
+     float2 * triangleUVCentroids = nullptr;
+     int3* originTriangleArray = nullptr;
+ 
++    // for multi-gpu
++    int originNumTriangles = 0;
++    int3* originTriangleIndices = nullptr;
++    int* triangleIdxList = nullptr; // index of each triangle in the original triangleIndices;
++
+     //float4 * stretchArray;
+     float4 * stretchShearStiffnessArray = nullptr; // 数组长度是 numTriangles
+     float2 * stretchShrinkageArray = nullptr; // 数组长度是 numTriangles
+@@ -297,6 +302,31 @@ struct VenusSimulationMultiGpuData
+     cudaStream_t* stream = nullptr;
+     int numParticle = 0;
+ 
++    void init()
++    {
++        // checkCudaErrors(cudaGetDeviceCount(&numDevice));
++        numDevice = 2;
++        simData = new VenusSimulationData[numDevice];
++        stream = new cudaStream_t[numDevice];
++        creatCudaStream();
++    }
++
++    void assignParticleToDevice(int n)
++    {
++        numParticle = n;
++        int averageNum = numParticle / numDevice;
++        int lastDeviceNum = numParticle - averageNum * (numDevice - 1);
++        
++        for(int i = 0; i < numDevice; i++)
++        {
++            int startIdx = i * averageNum;
++            int currentDeviceNum = i == numDevice - 1 ? lastDeviceNum : averageNum;
++            // simData[i].deviceID = i;
++            simData[i].deviceID = 0;
++            simData[i].particleRange = make_int2(startIdx, currentDeviceNum);
++        }
++    }
++
+     struct SplitBunchData
+     {
+         std::vector<int2> indices;
+@@ -307,6 +337,7 @@ struct VenusSimulationMultiGpuData
+     struct SplitARAPData
+     {
+         std::vector<int3> triangleIndices;
++        std::vector<int> triangleIdxList;
+         Point4FSequence stretchShearStiffnessArray;
+         Point2FSequence stretchShrinkageArray;
+         FloatSequence internalDampingArray;
+@@ -345,31 +376,6 @@ struct VenusSimulationMultiGpuData
+         std::vector<float> bendingRestElen;
+     };
+ 
+-    void init()
+-    {
+-        // checkCudaErrors(cudaGetDeviceCount(&numDevice));
+-        numDevice = 2;
+-        simData = new VenusSimulationData[numDevice];
+-        stream = new cudaStream_t[numDevice];
+-        creatCudaStream();
+-    }
+-
+-    void assignParticleToDevice(int n)
+-    {
+-        numParticle = n;
+-        int averageNum = numParticle / numDevice;
+-        int lastDeviceNum = numParticle - averageNum * (numDevice - 1);
+-        
+-        for(int i = 0; i < numDevice; i++)
+-        {
+-            int startIdx = i * averageNum;
+-            int currentDeviceNum = i == numDevice - 1 ? lastDeviceNum : averageNum;
+-            // simData[i].deviceID = i;
+-            simData[i].deviceID = 0;
+-            simData[i].particleRange = make_int2(startIdx, startIdx + currentDeviceNum);
+-        }
+-    }
+-
+     void _splitBunchData(const VenusHostData& hostData)
+     {
+         std::vector<SplitBunchData> bunchData(numDevice);
+@@ -447,12 +453,12 @@ struct VenusSimulationMultiGpuData
+ 
+     }
+ 
+-
+     void _splitARAPData(const VenusHostData& hostData)
+     {
+         std::vector<SplitARAPData> arapData(numDevice);
+         for (int i = 0; i < numDevice; i++) {
+             arapData[i].triangleIndices.reserve(hostData.numTriangles);
++            arapData[i].triangleIdxList.reserve(hostData.numTriangles);
+             arapData[i].stretchShearStiffnessArray.reserve(hostData.numTriangles);
+             arapData[i].stretchShrinkageArray.reserve(hostData.numTriangles);
+             arapData[i].internalDampingArray.reserve(hostData.numTriangles);
+@@ -471,6 +477,7 @@ struct VenusSimulationMultiGpuData
+                 {
+                     int3 tmp = {tri.x, tri.y, tri.z};
+                     arapData[id].triangleIndices.emplace_back(tmp);
++                    arapData[id].triangleIdxList.emplace_back(idx);
+                     arapData[id].stretchShearStiffnessArray.emplace_back(hostData.stretchShearStiffnessArray[idx]);
+                     arapData[id].stretchShrinkageArray.emplace_back(hostData.stretchShrinkageArray[idx]);
+                     arapData[id].internalDampingArray.emplace_back(hostData.internalDampingArray[idx]);
+@@ -493,6 +500,10 @@ struct VenusSimulationMultiGpuData
+             simData[i].triangleIndices = devMallocArray<int3>(simData[i].numTriangles);
+             copyH2D(arapData[i].triangleIndices.data(), simData[i].triangleIndices, simData[i].numTriangles * sizeof(int3));
+ 
++            // save the index of current triangle
++            simData[i].triangleIdxList = devMallocArray<int>(simData[i].numTriangles);
++            copyH2D(arapData[i].triangleIdxList.data(), simData[i].triangleIdxList, simData[i].numTriangles * sizeof(int));
++
+             simData[i].stretchShrinkageArray = devMallocArray<float2>(simData[i].numTriangles);
+             copyH2D(arapData[i].stretchShrinkageArray.data(), simData[i].stretchShrinkageArray, simData[i].numTriangles * sizeof(float2));
+ 
+@@ -617,7 +628,6 @@ struct VenusSimulationMultiGpuData
+         }
+     }
+ 
+-
+     void _splitSewBlockData(const VenusHostData& hostData)
+     {
+         std::vector<SplitSewBlockData> sewBlockData(numDevice);
+diff --git a/Solvers/VenusSolver/Core/VenusSolverData.cpp b/Solvers/VenusSolver/Core/VenusSolverData.cpp
+index beb88f22..a7ea79e1 100644
+--- a/Solvers/VenusSolver/Core/VenusSolverData.cpp
++++ b/Solvers/VenusSolver/Core/VenusSolverData.cpp
+@@ -1631,8 +1631,8 @@ void VenusSolverData::_initMultiGpuCgCudaContext()
+         cusparseSetMatType(cudaData.descr, CUSPARSE_MATRIX_TYPE_GENERAL);
+         cusparseSetMatIndexBase(cudaData.descr, CUSPARSE_INDEX_BASE_ZERO);
+     }
+-
+ }
++
+ void VenusSolverData::_initCgCudaContext()
+ {
+     VenusCgCudaData &cudaData = m_simData.m_cgCudaData;
+@@ -1717,6 +1717,12 @@ void VenusSolverData::_initSimulationMultiGpuNoneSplitData(IN const VenusHostDat
+         // 是否需要拆分？？？ 算法中暂未使用到
+         simData.originTriangleArray = hostMallocArray<int3>(hostData.numTriangles);
+         copyH2H(hostData.triangleArray.data(), simData.originTriangleArray, hostData.numTriangles * sizeof(int3));
++
++        // for multi-gpu, used for build full bvh
++        simData.originNumTriangles = hostData.numTriangles;
++        simData.originTriangleIndices = hostMallocArray<int3>(hostData.numTriangles);
++        copyH2D(hostData.triangleArray.data(), simData.originTriangleIndices, hostData.numTriangles * sizeof(int3));
++
+         //soft sew vertex
+         for (int i = 0; i < m_softSewPairs.size(); i++)
+         {
+@@ -1750,7 +1756,7 @@ void VenusSolverData::_initSimulationMultiGpuNoneSplitData(IN const VenusHostDat
+         copyH2D(hostData.triangleInfoArray.data(), simData.d_triangleInfos, sizeof(int32_TriangleInfo)*simData.numTriangles);
+ 
+         simData.d_triangleCollisionRadius = devMallocArray<float>(hostData.numTriangles);
+-        copyH2D(hostData.triangleCollisionRadius.data(), simData.d_triangleCollisionRadius, sizeof(float)*simData.numTriangles);
++        copyH2D(hostData.triangleCollisionRadius.data(), simData.d_triangleCollisionRadius, sizeof(float)*hostData.numTriangles);
+ 
+         simData.d_cutInfos = devMallocArray<VenusCutInfo>((int)hostData.cutInfoArray.size());
+         copyH2D(hostData.cutInfoArray.data(), simData.d_cutInfos, hostData.cutInfoArray.size() * sizeof(VenusCutInfo));
+@@ -1838,8 +1844,8 @@ void VenusSolverData::_initSimulationMultiGpuSplitData(IN const VenusHostData& h
+     CCE
+     m_simMultiGpuData._splitVirtualSewData(hostData);
+     CCE
+-    m_simMultiGpuData._splitVolumeData(hostData);
+-    CCE
++    // m_simMultiGpuData._splitVolumeData(hostData);
++    // CCE
+ }
+ 
+ void VenusSolverData::_initSimulationMultiGpuCollisionData(IN const VenusHostData& hostData)
+@@ -1853,7 +1859,7 @@ void VenusSolverData::_initSimulationMultiGpuCollisionData(IN const VenusHostDat
+         m_simData.m_selfCollisionProximity.SetCollisionParams(m_simData.pColliParams);
+         m_simData.m_selfCollisionProximity.Setup(hostData.numParticles, m_simData.positions, m_simData.velocities,
+             m_simData.d_restVertexArea, m_simData.d_restTriangleArea, m_simData.d_adjacentTriangles,
+-            hostData.numTriangles, m_simData.triangleIndices, m_simData.d_repTriEncodings);
++            m_simData.originNumTriangles, m_simData.originTriangleIndices, m_simData.d_repTriEncodings);
+ 
+         //parameters need to be set first before any memory allocation
+         m_simData.pHashGrid->SetCollisionParams(m_simData.pColliParams);
+@@ -1916,7 +1922,7 @@ void VenusSolverData::_initSimulationMultiGpuCollisionData(IN const VenusHostDat
+         m_simData.pBroadPhaseLbvh->setCollisionParams(m_simData.pColliParams);
+         m_simData.pBroadPhaseLbvh->initData(m_simData.positions, m_simData.restPosition, m_simData.velocities,
+             m_simData.d_triangleCollisionRadius, m_simData.d_particleCollisionRadius,
+-            m_simData.triangleIndices, m_simData.numParticle, m_simData.numTriangles,
++            m_simData.originTriangleIndices, m_simData.numParticle, m_simData.originNumTriangles,
+             m_simData.d_rigidVertices, m_simData.d_rigidVerticesVels, m_simData.d_rigidTriCollisionRadius,
+             m_simData.d_rigidTriangles, m_simData.d_numRigidVertex, m_simData.d_numRigidTriangles,
+             m_simData.d_deformParticleCountArray, m_simData.d_deformPrimitiveCountArray, m_simData.numDeforms);
+@@ -1952,7 +1958,6 @@ void VenusSolverData::_initSimulationMultiGpuData(IN const VenusHostData& hostDa
+     _initSimulationMultiGpuNoneSplitData(hostData);
+     _initSimulationMultiGpuSplitData(hostData);
+ 
+-
+     CCE
+     _initSparseMatrixSolverMultiGpuData(hostData);
+     CCE
+@@ -4075,7 +4080,9 @@ void VenusSolverData::Update(ISimulationSessionLowLevel* pSession)
+             //_releaseSparseMatrixSolverData();
+             //_initSparseMatrixSolverData(hostData);
+             //_releaseSparseMatrixSolverData();
+-            _mergeParticles(frameID == 10);
++
++            // _mergeParticles(frameID == 10);
++            
+             //_initSparseMatrixSolverData(m_initHostData);
+         }
+     }
+@@ -4257,7 +4264,15 @@ void VenusSolverData::Update(ISimulationSessionLowLevel* pSession)
+             POP_RANGE;
+             timer.end("reset simulation data");
+             PUSH_RANGE("Solver Update", 0);
+-            m_cg.UpdateGPU(dt, bDynamic, m_simData, params, m_initHostData);
++            if (params.bEnableMultiGpu) {
++                for(int id = 0; id < m_simMultiGpuData.numDevice; id++) {
++                    VenusSimulationData& currentSimData = m_simMultiGpuData.simData[id];
++                    checkCudaErrors(cudaSetDevice(currentSimData.deviceID));
++                    m_cg.UpdateGPU(dt, bDynamic, currentSimData, params, m_initHostData, id);
++                }
++            } else {
++                m_cg.UpdateGPU(dt, bDynamic, m_simData, params, m_initHostData, 0);
++            }
+             POP_RANGE;
+         }
+     }
+diff --git a/Solvers/VenusSolver/Lbvh/lbvh.cpp b/Solvers/VenusSolver/Lbvh/lbvh.cpp
+index 595e0d93..8c7d0c2f 100644
+--- a/Solvers/VenusSolver/Lbvh/lbvh.cpp
++++ b/Solvers/VenusSolver/Lbvh/lbvh.cpp
+@@ -795,6 +795,59 @@ int BroadPhaseLbvh::generateCollisionPair(int2 *devPairArray, int maxNum, int *d
+     return trueCollisonNum;
+ }
+ 
++int BroadPhaseLbvh::generateCollisionPairMultiGpu(int2 *devPairArray, int maxNum, int *devCollisionCount, bool bNctt, int3* devTriangleIndices, int numTriangles, int* triangleIdxList)
++{
++    if (m_numClothPrimitive < 2)
++    {
++        printf("[hw] %s: cloth primitive is less than 2\n", __FUNCTION__);
++        return 0;
++    }
++
++    //bind texture
++    if (!CULLING_WITH_RANGE)
++    {
++        bindTexture(m_numClothPrimitive, m_dClothTextPrimitiveIdx,
++            m_dClothTextLeftChildIdx, m_dClothTextRightChildIdx, m_dClothTextAabbCord, m_dClothTextInvMass);
++    }
++    else
++    {
++        bindRangeTexture(m_numClothPrimitive, m_dClothTextPrimitiveIdx, m_dClothTextRangeRightIdx,
++            m_dClothTextLeftChildIdx, m_dClothTextRightChildIdx, m_dClothTextAabbCord, m_dClothTextInvMass);
++    }
++
++    if(bNctt)
++        bindNctCodeTexture(m_numClothPrimitive, m_dClothTextNctCode);
++    //self collision
++    //int rootNodeIdx = 0;
++    //auto stream = _getStream();
++    //cudaMemcpyAsync(&rootNodeIdx, m_dClothRootNode, sizeof(int), cudaMemcpyDeviceToHost);
++    
++//	int nodeSize = 2 * m_numClothPrimitive - 1;
++//	std::vector<int> textNctCodeArray(nodeSize);
++//	copyD2H(m_dClothTextNctCode, textNctCodeArray.data(), sizeof(int) * nodeSize);
++	
++    findCollisionRMultiGpu(numTriangles, m_dClothRootNode, m_dClothLeafNode, devPairArray, devCollisionCount, m_dNctCode, maxNum, bNctt, devTriangleIndices, triangleIdxList);
++    //_releaseStream(stream);
++    CCE
++
++    //unbind texture
++    if(!CULLING_WITH_RANGE)
++        unBindTexture();
++    else
++        unRangeBindTexture();
++    if(bNctt)
++        unBindNctCodeTexture();
++    int trueCollisonNum;
++    cudaMemcpy(&trueCollisonNum, devCollisionCount, sizeof(int), cudaMemcpyDeviceToHost);
++    CCE
++
++    if (trueCollisonNum > maxNum)
++    {
++        printf("[hw] ran ouf of collison pair cache! %d > %d %s\n", trueCollisonNum, maxNum, __FUNCTION__);
++    }
++    return trueCollisonNum;
++}
++
+ int BroadPhaseLbvh::generateCmPTCollisionPair(int2 *devPairArray, int maxNum, int *devCollisionCount)
+ {
+     //bind texture
+diff --git a/Solvers/VenusSolver/Lbvh/lbvh.cu b/Solvers/VenusSolver/Lbvh/lbvh.cu
+index d25a6ab7..b5573b1f 100644
+--- a/Solvers/VenusSolver/Lbvh/lbvh.cu
++++ b/Solvers/VenusSolver/Lbvh/lbvh.cu
+@@ -401,6 +401,14 @@
+             devCollisionPair, devColliisonCount, devNctCode, maxCount, bNctt, devTriangleIndices);
+     }
+ 
++    void findCollisionRMultiGpu(int sample_size, int *rootNodeIdx, LbvhNode *devLeafNode,
++        int2 *devCollisionPair, int *devColliisonCount, int * devNctCode, int maxCount, bool bNctt, int3* devTriangleIndices, int* triangleIdxList)
++    {
++        int grid_size, block_size;
++        roundup(&grid_size, &block_size, sample_size, _kernel_findCollisionRMultiGpu);
++        _kernel_findCollisionRMultiGpu << <grid_size, block_size >> > (sample_size, rootNodeIdx, devLeafNode,
++            devCollisionPair, devColliisonCount, devNctCode, maxCount, bNctt, devTriangleIndices, triangleIdxList);
++    }
+ 
+     void findCmCollisionI4(int sample_size, int rootNodeIdx, AABB* devClothAabb,  LbvhNode *devModelLeafNode,
+         int4 *devCollisionPair, int *devColliisonCount, int maxCount, const cudaStream_t & stream)
+@@ -2369,6 +2377,172 @@
+         }
+     }
+ 
++    __global__ void
++        _kernel_findCollisionRMultiGpu(int sample_size, int *rootNodeIdx, LbvhNode *devLeafNode,
++            int2 *devCollisionPair, int *devColliisonCount, int * devNctCode, int maxCount, bool bNctt, int3* devTriangleIndices, int* triangleIdxList)
++    {
++        int idxOrigin = threadIdx.x + blockDim.x * blockIdx.x;
++
++        if (idxOrigin >= sample_size || isFoundNanOrInf)
++            return;
++
++        // for multi-gpu
++        int idx = triangleIdxList[idxOrigin];
++
++        int stack[64];
++        int *stackPtr = stack;
++        *stackPtr++ = -1; //push
++
++        //Traverse nodes from the root
++        int node = *rootNodeIdx;
++
++        //current leaf data
++        int lfPdx = tex1Dfetch(lbvhParticleIdxTex, idx);
++
++        //int3 currentTriangleId = devTriangleIndices[lfPdx];
++        float4 aabb_min = tex1Dfetch(lbvhAabbTex, idx * 2);
++        float4 aabb_max = tex1Dfetch(lbvhAabbTex, idx * 2 + 1);
++        AABB lfAabb(make_float3(aabb_min), make_float3(aabb_max));
++        float lfInvMass = tex1Dfetch(lbvhInvMassTex, idx);
++        int lfNctCode = 0;
++        if (bNctt)
++            lfNctCode = tex1Dfetch(lbvhNctCodeTex, idx);
++
++		/*if (lfPdx == 90368)
++		{
++			for (int i = 0; i < sample_size; ++i)
++			{
++				if (tex1Dfetch(lbvhNctCodeTex, i) == lfNctCode)
++				{
++					int samePdx = devLeafNode[i].particle_idx;
++					printf("same as Pdx(90368) pdx:%d NctCodeTex:%d NctCode:%d\n", samePdx, i, lfNctCode);
++				}
++			}
++		}*/
++
++        int rangeRight, nctCode;
++        while (node != -1)
++        {
++            //left child idx, right child idx, left child of left child, left child of right child
++            int lcIdx, rcIdx, lclcIdx, lcrcIdx;
++            //left child particle idx, right child particle idx
++            int lcPdx, rcPdx;
++            //aabb box
++            float4 lcAabbMin, lcAabbMax;
++            float4 rcAabbMin, rcAabbMax;
++            //invmass
++            float invMassLc = 0.f, invMassRc = 0.f;
++            //nctCode
++            int nctCodeLc = 0;
++            int nctCodeRc = 0;
++            //lbvh tree node index
++            lcIdx = tex1Dfetch(lbvhLeftChildIdxTex, node);
++            rcIdx = tex1Dfetch(lbvhRightChildIdxTex, node);
++
++            lclcIdx = tex1Dfetch(lbvhLeftChildIdxTex, lcIdx);
++            lcrcIdx = tex1Dfetch(lbvhLeftChildIdxTex, rcIdx);
++
++            //particle index
++            lcPdx = tex1Dfetch(lbvhParticleIdxTex, lcIdx);
++            rcPdx = tex1Dfetch(lbvhParticleIdxTex, rcIdx);
++
++            lcAabbMin = tex1Dfetch(lbvhAabbTex, lcIdx * 2);
++            lcAabbMax = tex1Dfetch(lbvhAabbTex, lcIdx * 2 + 1);
++            AABB lcAabb(make_float3(lcAabbMin), make_float3(lcAabbMax));
++
++            rcAabbMin = tex1Dfetch(lbvhAabbTex, rcIdx * 2);
++            rcAabbMax = tex1Dfetch(lbvhAabbTex, rcIdx * 2 + 1);
++            AABB rcAabb(make_float3(rcAabbMin), make_float3(rcAabbMax));
++            //int3 leftTriangleId, rightTriangleId
++            //if lclcIdx is -1, then it's leaf node
++            if (lclcIdx == -1)
++            {
++                invMassLc = tex1Dfetch(lbvhInvMassTex, lcIdx);
++				if (bNctt)
++					nctCodeLc = tex1Dfetch(lbvhNctCodeTex, lcIdx);
++            }
++
++            if (lcrcIdx == -1)
++            {
++                invMassRc = tex1Dfetch(lbvhInvMassTex, rcIdx);
++				if (bNctt)
++					nctCodeRc = tex1Dfetch(lbvhNctCodeTex, rcIdx);
++            }
++
++            rangeRight = tex1Dfetch(lbvhRangeRightIdxTex, node);
++			nctCode = tex1Dfetch(lbvhNctCodeTex, node);
++
++            //printf("rangeL:%d,rangeR:%d\n", lcRangeRight, rcRangeRight);
++            bool isLcOverlap = lfAabb.overlaps(lcAabb);
++            bool isRcOverlap = lfAabb.overlaps(rcAabb);
++			/*if ((bNctt && lfNctCode == nctCode))
++				printf("lfNctCode == nctCode\n");
++			else
++				printf("lfNctCode = %d, nctCode = %d node = %d\n", lfNctCode, nctCode, node);*/
++			if ((rangeRight >= 0 && idx > rangeRight) || (bNctt && lfNctCode == nctCode))
++            {
++                isLcOverlap = false;
++                isRcOverlap = false;
++            }
++                
++            //printf("node:%d, idx:%d, %d\n", node,idx,countJ++);
++            //broad phase lbvh collison condition:
++            //1,both leaf node
++            //2,either invMass is bigger than 0
++            //3,both particles are active(in venus, inactive particle's invMass was set to 0)
++            //4,not duplicate, for example, pair [4, 3], [3, 4] are duplicate collision pairs
++            //5,overlap
++            bool isLcCollisionPair = (invMassLc > 0 || lfInvMass > 0) && (lclcIdx == -1) && (idx < lcIdx) && isLcOverlap &&
++                (!bNctt || lfNctCode != nctCodeLc);
++            if (isLcCollisionPair)
++            {
++                //leftTriangleId = devTriangleIndices[lcPdx];
++                //if (triangleBelongArray[lfPdx].deformID != triangleBelongArray[lcPdx].deformID)
++                //if (!bNctt || devNctCode[lfPdx] != devNctCode[lcPdx])
++                //if (findSharedVertex(currentTriangleId, leftTriangleId))
++                {
++                    int idx = atomicAdd(devColliisonCount, 1);
++                    if (idx < maxCount)
++                    {
++                        devCollisionPair[idx] = make_int2(lfPdx, lcPdx);
++                        //printf("collision pair lc [%d,%d] %f,%f\n", lfPdx, lcPdx, invMassLc, lfInvMass);
++                    }
++                }
++            }
++
++            bool isRcCollisionPair = (invMassRc > 0 || lfInvMass > 0) && (lcrcIdx == -1) && (idx < rcIdx) && isRcOverlap &&
++                (!bNctt || lfNctCode != nctCodeRc);
++            if (isRcCollisionPair)
++            {
++                //rightTriangleId = devTriangleIndices[rcPdx];
++                //if (triangleBelongArray[lfPdx].deformID != triangleBelongArray[rcPdx].deformID)
++                //if (!bNctt || devNctCode[lfPdx] != devNctCode[rcPdx])
++                //if (!findSharedVertex(currentTriangleId, rightTriangleId))
++                {
++                    int idx = atomicAdd(devColliisonCount, 1);
++                    if (idx < maxCount)
++                    {
++                        devCollisionPair[idx] = make_int2(lfPdx, rcPdx);
++                        //printf("collision pair rc [%d,%d]\n", lfPdx, rcPdx);
++                    }
++                }
++            }
++
++            //continue query overlaps for internal node
++            bool isNeedLcQuery = isLcOverlap && lclcIdx != -1;
++            bool isNeedRcQuery = isRcOverlap && lcrcIdx != -1;
++
++            if (!isNeedLcQuery && !isNeedRcQuery)
++                node = *--stackPtr;//pop
++            else
++            {
++                node = isNeedLcQuery ? lcIdx : rcIdx;
++                if (isNeedLcQuery && isNeedRcQuery)
++                    *stackPtr++ = rcIdx;//push
++            }
++        }
++    }
++
+     __global__ void
+         _kernel_findCmCollisionI2(int sample_size, int rootNodeIdx, AABB *devClothAabb, LbvhNode *devModelLeafNode,
+             int2 *devCollisionPair, int *devColliisonCount, int maxCount)
+diff --git a/Solvers/VenusSolver/Lbvh/lbvh.cuh b/Solvers/VenusSolver/Lbvh/lbvh.cuh
+index 9eaa7fbb..3ff84f40 100644
+--- a/Solvers/VenusSolver/Lbvh/lbvh.cuh
++++ b/Solvers/VenusSolver/Lbvh/lbvh.cuh
+@@ -128,6 +128,9 @@ void findCollisionR(int sample_size, int *rootNodeIdx, LbvhNode *devLeafNode,
+ void findCollisionR(int sample_size, int *rootNodeIdx, LbvhNode *devLeafNode,
+     int2 *devCollisionPair, int *devColliisonCount, int2 * devNctCode, int maxCount, bool bNctt, int3* devTriangleIndices);
+ 
++void findCollisionRMultiGpu(int sample_size, int *rootNodeIdx, LbvhNode *devLeafNode,
++    int2 *devCollisionPair, int *devColliisonCount, int * devNctCode, int maxCount, bool bNctt, int3* devTriangleIndices, int* triangleIdxList);
++
+ void transfer2EdgeIndice(int collisionNum, int4 *collisionPair, int2* devClothEdge, int2 *devModelEdge);
+ 
+ void initNcttNode(MortonType64* devMortonCode, int sampleSize,
+@@ -262,6 +265,11 @@ void fillNctCode(unsigned int deformId, int sampleSize, int* devNctCode, LbvhNod
+         _kernel_findCollisionR(int sample_size, int *rootNodeIdx, LbvhNode *devLeafNode,
+             int2 *devCollisionPair, int *devColliisonCount, int * devNctCode, int maxCount, bool bNctt, int3* devTriangleIndices);
+ 
++    __global__ void
++        _kernel_findCollisionRMultiGpu(int sample_size, int *rootNodeIdx, LbvhNode *devLeafNode,
++            int2 *devCollisionPair, int *devColliisonCount, int * devNctCode, int maxCount, bool bNctt, int3* devTriangleIndices,
++            int* triangleIdxList);
++
+     __global__ void
+         _kernel_findCmCollisionI4(int sample_size, int rootNodeIdx, AABB* devAabb, LbvhNode *devModelLeafNode,
+             int4 *devCollisionPair, int *devColliisonCount, int maxCount);
+diff --git a/Solvers/VenusSolver/Lbvh/lbvh.h b/Solvers/VenusSolver/Lbvh/lbvh.h
+index aab4ce86..cc8a0c56 100644
+--- a/Solvers/VenusSolver/Lbvh/lbvh.h
++++ b/Solvers/VenusSolver/Lbvh/lbvh.h
+@@ -13,7 +13,7 @@
+ #define MAX_STREAM  100
+ #define MAX_NCTT  256
+ #define CULLING_WITH_RANGE 1
+-#define ENABLE_NCTT 1
++#define ENABLE_NCTT 0
+ #define OneNctt 0
+ #define NCTT_SKIP 5
+ #define NCTT_DEBUG 0
+@@ -238,6 +238,9 @@ public:
+     __host__ int
+         generateCollisionPair(int2 *devPairArray, int maxNum, int *devCollisionCount, bool bNctt, int3* devTriangleIndices);
+ 
++    __host__ int
++        generateCollisionPairMultiGpu(int2 *devPairArray, int maxNum, int *devCollisionCount, bool bNctt, int3* devTriangleIndices, int numTriangles, int* triangleIdxList);
++
+     // cc tt
+     //__host__ int
+     //    generateCMEECollisionPair(int4 *devPairArray, int maxNum, int *devCollisionCount);
+diff --git a/Solvers/VenusSolver/untangle/global_untangle.cu b/Solvers/VenusSolver/untangle/global_untangle.cu
+index bbb728a0..66c5e009 100644
+--- a/Solvers/VenusSolver/untangle/global_untangle.cu
++++ b/Solvers/VenusSolver/untangle/global_untangle.cu
+@@ -82,7 +82,7 @@
+             TriIntesertPos* pPairInterPt = mTIPArray+pairID;
+             if (pPairInterPt->mType == TriIntersectPosType::TIPT_UNDEFINE)
+                 continue;
+-            assert(pPairInterPt->mGraphID == -1);
++            // assert(pPairInterPt->mGraphID == -1);
+ 
+             //a new graph
+             ++graphId;
+-- 
+2.36.1.windows.1
+
